@@ -1,6 +1,6 @@
 package com.mongodb.mandate.service;
 
-import com.mongodb.mandate.model.DirectDebitMandate;
+import com.mongodb.mandate.model.MandateFileRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,11 +13,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
-import java.util.NoSuchElementException;
 
-public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoCloseable {
+public class MandateFileReader implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(MandateFileReader.class);
     private static final String DELIMITER = "\\|";
@@ -26,7 +24,6 @@ public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoClos
 
     private final BufferedReader reader;
     private final String fileName;
-    private String[] headers;
     private long lineNumber = 0;
 
     public MandateFileReader(Path filePath) throws IOException {
@@ -39,7 +36,7 @@ public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoClos
         String headerLine = reader.readLine();
         lineNumber++;
         if (headerLine != null) {
-            headers = headerLine.split(DELIMITER);
+            String[] headers = headerLine.split(DELIMITER);
             logger.info("Read {} columns from header", headers.length);
         }
     }
@@ -48,19 +45,16 @@ public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoClos
         return fileName;
     }
 
-    /**
-     * Read mandates in batches for memory efficiency
-     */
-    public List<DirectDebitMandate> readBatch(int batchSize) throws IOException {
-        List<DirectDebitMandate> batch = new ArrayList<>(batchSize);
+    public List<MandateFileRecord> readBatch(int batchSize) throws IOException {
+        List<MandateFileRecord> batch = new ArrayList<>(batchSize);
         String line;
 
         while (batch.size() < batchSize && (line = reader.readLine()) != null) {
             lineNumber++;
             try {
-                DirectDebitMandate mandate = parseLine(line);
-                if (mandate != null) {
-                    batch.add(mandate);
+                MandateFileRecord record = parseLine(line);
+                if (record != null) {
+                    batch.add(record);
                 }
             } catch (Exception e) {
                 logger.error("Error parsing line {}: {}", lineNumber, e.getMessage());
@@ -70,15 +64,15 @@ public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoClos
         return batch;
     }
 
-    private DirectDebitMandate parseLine(String line) {
+    private MandateFileRecord parseLine(String line) {
         if (line == null || line.trim().isEmpty()) {
             return null;
         }
 
-        String[] values = line.split(DELIMITER, -1); // -1 to keep trailing empty strings
+        String[] values = line.split(DELIMITER, -1);
 
         try {
-            return DirectDebitMandate.builder()
+            return MandateFileRecord.builder()
                     .mandateId(getStringValue(values, 0))
                     .lastUpdateDate(getDateTimeValue(values, 1))
                     .creditorId(getStringValue(values, 2))
@@ -109,7 +103,7 @@ public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoClos
                     .schemeType(getStringValue(values, 27))
                     .build();
         } catch (Exception e) {
-            logger.error("Error parsing mandate at line {}: {}", lineNumber, e.getMessage());
+            logger.error("Error parsing record at line {}: {}", lineNumber, e.getMessage());
             return null;
         }
     }
@@ -142,40 +136,6 @@ public class MandateFileReader implements Iterable<DirectDebitMandate>, AutoClos
         String value = getStringValue(values, index);
         if (value == null) return null;
         return Integer.parseInt(value);
-    }
-
-    @Override
-    public Iterator<DirectDebitMandate> iterator() {
-        return new MandateIterator();
-    }
-
-    private class MandateIterator implements Iterator<DirectDebitMandate> {
-        private String nextLine;
-
-        @Override
-        public boolean hasNext() {
-            if (nextLine != null) {
-                return true;
-            }
-            try {
-                nextLine = reader.readLine();
-                return nextLine != null;
-            } catch (IOException e) {
-                logger.error("Error reading file: {}", e.getMessage());
-                return false;
-            }
-        }
-
-        @Override
-        public DirectDebitMandate next() {
-            if (!hasNext()) {
-                throw new NoSuchElementException();
-            }
-            String line = nextLine;
-            nextLine = null;
-            lineNumber++;
-            return parseLine(line);
-        }
     }
 
     @Override

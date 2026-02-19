@@ -1,8 +1,8 @@
 package com.mongodb.mandate.service;
 
-import com.mongodb.mandate.model.DirectDebitMandate;
-import com.mongodb.mandate.model.FieldChange;
-import com.mongodb.mandate.model.MandateAudit;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.TransactionBody;
+import com.mongodb.mandate.model.*;
 import com.mongodb.mandate.repository.MandateRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,12 +21,14 @@ public class MandateProcessor {
     private final MandateDiffService diffService;
     private final int batchSize;
 
-    // Processing statistics
+    // Statistics
     private long totalProcessed = 0;
     private long insertCount = 0;
     private long updateCount = 0;
     private long skipCount = 0;
     private long errorCount = 0;
+    private long newCreditors = 0;
+    private long newDebtors = 0;
 
     public MandateProcessor(MandateRepository repository, int batchSize) {
         this.repository = repository;
@@ -34,9 +36,6 @@ public class MandateProcessor {
         this.batchSize = batchSize;
     }
 
-    /**
-     * Process a mandate file
-     */
     public void processFile(Path filePath) throws IOException {
         logger.info("Starting to process file: {}", filePath);
         long startTime = System.currentTimeMillis();
@@ -45,7 +44,7 @@ public class MandateProcessor {
         resetStatistics();
 
         try (MandateFileReader reader = new MandateFileReader(filePath)) {
-            List<DirectDebitMandate> batch;
+            List<MandateFileRecord> batch;
 
             while (!(batch = reader.readBatch(batchSize)).isEmpty()) {
                 processBatch(batch, reader.getFileName(), batchId);
@@ -61,163 +60,229 @@ public class MandateProcessor {
         logStatistics(duration);
     }
 
-    /**
-     * Process a batch of mandates
-     */
-    private void processBatch(List<DirectDebitMandate> mandates, String sourceFile, String batchId) {
-        // Extract mandate IDs for batch lookup
-        List<String> mandateIds = mandates.stream()
-                .map(DirectDebitMandate::getMandateId)
+    private void processBatch(List<MandateFileRecord> records, String sourceFile, String batchId) {
+        // Extract mandate IDs
+        List<String> mandateIds = records.stream()
+                .map(MandateFileRecord::getMandateId)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
-        // Batch query for existing mandate dates (uses covering index)
+        // Get existing mandate dates
         Map<String, LocalDateTime> existingDates = repository.batchGetMandateUpdateDates(mandateIds);
 
-        // Categorize mandates
-        List<DirectDebitMandate> toInsert = new ArrayList<>();
+        // Categorize records
+        List<MandateFileRecord> toInsert = new ArrayList<>();
         List<String> toCheckForUpdate = new ArrayList<>();
-        List<DirectDebitMandate> unchangedMandates = new ArrayList<>();
 
-        for (DirectDebitMandate mandate : mandates) {
-            String mandateId = mandate.getMandateId();
+        for (MandateFileRecord record : records) {
+            String mandateId = record.getMandateId();
 
             if (!existingDates.containsKey(mandateId)) {
-                // New mandate - needs insert
-                toInsert.add(mandate);
+                toInsert.add(record);
             } else {
                 LocalDateTime existingDate = existingDates.get(mandateId);
-                LocalDateTime newDate = mandate.getLastUpdateDate();
+                LocalDateTime newDate = record.getLastUpdateDate();
 
                 if (existingDate != null && newDate != null && existingDate.equals(newDate)) {
-                    // Same update date - skip
-                    unchangedMandates.add(mandate);
+                    skipCount++;
                 } else {
-                    // Different update date - needs comparison
                     toCheckForUpdate.add(mandateId);
                 }
             }
         }
 
-        // Process inserts
+        // Process inserts with transactions
         if (!toInsert.isEmpty()) {
             processInserts(toInsert, sourceFile, batchId);
         }
 
-        // Process potential updates (need to fetch full documents for comparison)
+        // Process updates
         if (!toCheckForUpdate.isEmpty()) {
-            processUpdates(mandates, toCheckForUpdate, sourceFile, batchId);
+            processUpdates(records, toCheckForUpdate, sourceFile, batchId);
         }
-
-        // Count skipped
-        skipCount += unchangedMandates.size();
     }
 
-    /**
-     * Process new mandates for insertion
-     */
-    private void processInserts(List<DirectDebitMandate> mandates, String sourceFile, String batchId) {
-        try {
-            // Batch insert mandates
-            repository.batchInsertMandates(mandates);
+    private void processInserts(List<MandateFileRecord> records, String sourceFile, String batchId) {
+        // Collect all creditor and debtor IDs
+        Set<String> creditorIds = records.stream()
+                .map(MandateFileRecord::getCreditorId)
+                .collect(Collectors.toSet());
 
-            // Create audit records for inserts
-            LocalDateTime now = LocalDateTime.now();
-            List<MandateAudit> audits = mandates.stream()
-                    .map(mandate -> MandateAudit.builder()
-                            .mandateId(mandate.getMandateId())
-                            .changeType("INSERT")
-                            .changeTimestamp(now)
-                            .sourceFile(sourceFile)
-                            .newUpdateDate(mandate.getLastUpdateDate())
-                            .fieldChanges(Collections.emptyList())
-                            .processedBy(System.getProperty("user.name", "system"))
-                            .batchId(batchId)
-                            .build())
-                    .collect(Collectors.toList());
+        Set<String> debtorIds = records.stream()
+                .map(MandateFileRecord::generateDebtorId)
+                .collect(Collectors.toSet());
 
+        // Check which already exist
+        Set<String> existingCreditors = repository.getExistingCreditorIds(creditorIds);
+        Set<String> existingDebtors = repository.getExistingDebtorIds(debtorIds);
+
+        List<MandateAudit> audits = new ArrayList<>();
+        LocalDateTime now = LocalDateTime.now();
+
+        for (MandateFileRecord record : records) {
+            String debtorId = record.generateDebtorId();
+            boolean insertCreditor = !existingCreditors.contains(record.getCreditorId());
+            boolean insertDebtor = !existingDebtors.contains(debtorId);
+
+            // Build entities
+            Creditor creditor = insertCreditor ? buildCreditor(record) : null;
+            Debtor debtor = insertDebtor ? buildDebtor(record, debtorId) : null;
+            DirectDebitMandate mandate = buildMandate(record, debtorId);
+
+            try {
+                // Use transaction for insert
+                try (ClientSession session = repository.getMongoClient().startSession()) {
+                    session.withTransaction((TransactionBody<Void>) () -> {
+                        repository.insertMandateWithTransaction(
+                                session, mandate, creditor, debtor, insertCreditor, insertDebtor);
+                        return null;
+                    });
+                }
+
+                // Track new entities
+                if (insertCreditor) {
+                    existingCreditors.add(record.getCreditorId());
+                    newCreditors++;
+                }
+                if (insertDebtor) {
+                    existingDebtors.add(debtorId);
+                    newDebtors++;
+                }
+
+                insertCount++;
+
+                // Create audit
+                audits.add(MandateAudit.builder()
+                        .mandateId(record.getMandateId())
+                        .changeType("INSERT")
+                        .changeTimestamp(now)
+                        .sourceFile(sourceFile)
+                        .newUpdateDate(record.getLastUpdateDate())
+                        .fieldChanges(Collections.emptyList())
+                        .processedBy(System.getProperty("user.name", "system"))
+                        .batchId(batchId)
+                        .build());
+
+            } catch (Exception e) {
+                logger.error("Transaction failed for mandate {}: {}", record.getMandateId(), e.getMessage());
+                errorCount++;
+            }
+        }
+
+        // Batch insert audits
+        if (!audits.isEmpty()) {
             repository.batchInsertAudits(audits);
-            insertCount += mandates.size();
-
-            logger.debug("Inserted {} new mandates", mandates.size());
-        } catch (Exception e) {
-            logger.error("Error inserting mandates: {}", e.getMessage());
-            errorCount += mandates.size();
         }
     }
 
-    /**
-     * Process mandates that need update comparison
-     */
-    private void processUpdates(List<DirectDebitMandate> allMandates,
+    private void processUpdates(List<MandateFileRecord> allRecords,
                                 List<String> mandateIdsToUpdate,
                                 String sourceFile, String batchId) {
 
-        // Create a map of new mandates by ID for quick lookup
-        Map<String, DirectDebitMandate> newMandatesMap = allMandates.stream()
-                .filter(m -> mandateIdsToUpdate.contains(m.getMandateId()))
-                .collect(Collectors.toMap(DirectDebitMandate::getMandateId, m -> m));
+        Map<String, MandateFileRecord> recordsMap = allRecords.stream()
+                .filter(r -> mandateIdsToUpdate.contains(r.getMandateId()))
+                .collect(Collectors.toMap(MandateFileRecord::getMandateId, r -> r));
 
-        // Fetch existing mandates for comparison
         Map<String, DirectDebitMandate> existingMandates = repository.batchGetMandates(mandateIdsToUpdate);
 
-        List<DirectDebitMandate> toUpdate = new ArrayList<>();
         List<MandateAudit> audits = new ArrayList<>();
         LocalDateTime now = LocalDateTime.now();
 
         for (String mandateId : mandateIdsToUpdate) {
             DirectDebitMandate existing = existingMandates.get(mandateId);
-            DirectDebitMandate updated = newMandatesMap.get(mandateId);
+            MandateFileRecord record = recordsMap.get(mandateId);
 
-            if (existing == null || updated == null) {
-                logger.warn("Missing mandate for comparison: {}", mandateId);
+            if (existing == null || record == null) {
                 errorCount++;
                 continue;
             }
 
-            // Diff the two records
+            String debtorId = record.generateDebtorId();
+            DirectDebitMandate updated = buildMandate(record, debtorId);
+
+            // Diff the mandates
             List<FieldChange> changes = diffService.diff(existing, updated);
 
             if (!changes.isEmpty()) {
-                // Apply changes while preserving system fields
-                DirectDebitMandate mergedMandate = diffService.applyChanges(existing, updated);
-                toUpdate.add(mergedMandate);
+                // Preserve system fields
+                updated.setId(existing.getId());
+                updated.setCreatedAt(existing.getCreatedAt());
+                updated.setVersion(existing.getVersion());
 
-                // Create audit record
-                MandateAudit audit = MandateAudit.builder()
-                        .mandateId(mandateId)
-                        .changeType("UPDATE")
-                        .changeTimestamp(now)
-                        .sourceFile(sourceFile)
-                        .previousUpdateDate(existing.getLastUpdateDate())
-                        .newUpdateDate(updated.getLastUpdateDate())
-                        .fieldChanges(changes)
-                        .processedBy(System.getProperty("user.name", "system"))
-                        .batchId(batchId)
-                        .build();
+                try {
+                    repository.updateMandate(updated);
+                    updateCount++;
 
-                audits.add(audit);
+                    audits.add(MandateAudit.builder()
+                            .mandateId(mandateId)
+                            .changeType("UPDATE")
+                            .changeTimestamp(now)
+                            .sourceFile(sourceFile)
+                            .previousUpdateDate(existing.getLastUpdateDate())
+                            .newUpdateDate(record.getLastUpdateDate())
+                            .fieldChanges(changes)
+                            .processedBy(System.getProperty("user.name", "system"))
+                            .batchId(batchId)
+                            .build());
 
-                logger.debug("Mandate {} has {} field changes", mandateId, changes.size());
+                } catch (Exception e) {
+                    logger.error("Update failed for mandate {}: {}", mandateId, e.getMessage());
+                    errorCount++;
+                }
             } else {
-                // No actual changes despite different update dates
                 skipCount++;
             }
         }
 
-        // Batch update mandates
-        if (!toUpdate.isEmpty()) {
-            try {
-                repository.batchUpdateMandates(toUpdate);
-                repository.batchInsertAudits(audits);
-                updateCount += toUpdate.size();
-
-                logger.debug("Updated {} mandates", toUpdate.size());
-            } catch (Exception e) {
-                logger.error("Error updating mandates: {}", e.getMessage());
-                errorCount += toUpdate.size();
-            }
+        if (!audits.isEmpty()) {
+            repository.batchInsertAudits(audits);
         }
+    }
+
+    private Creditor buildCreditor(MandateFileRecord record) {
+        return Creditor.builder()
+                .creditorId(record.getCreditorId())
+                .creditorName(record.getCreditorName())
+                .accountNumber(record.getCreditorAccountNumber())
+                .sortCode(record.getCreditorSortCode())
+                .iban(record.getCreditorIban())
+                .bic(record.getCreditorBic())
+                .build();
+    }
+
+    private Debtor buildDebtor(MandateFileRecord record, String debtorId) {
+        return Debtor.builder()
+                .debtorId(debtorId)
+                .name(record.getDebtorName())
+                .accountNumber(record.getDebtorAccountNumber())
+                .sortCode(record.getDebtorSortCode())
+                .iban(record.getDebtorIban())
+                .bic(record.getDebtorBic())
+                .email(record.getDebtorEmail())
+                .phone(record.getDebtorPhone())
+                .build();
+    }
+
+    private DirectDebitMandate buildMandate(MandateFileRecord record, String debtorId) {
+        return DirectDebitMandate.builder()
+                .mandateId(record.getMandateId())
+                .lastUpdateDate(record.getLastUpdateDate())
+                .creditorId(record.getCreditorId())
+                .debtorId(debtorId)
+                .mandateReference(record.getMandateReference())
+                .mandateType(record.getMandateType())
+                .frequency(record.getFrequency())
+                .status(record.getStatus())
+                .signatureDate(record.getSignatureDate())
+                .effectiveDate(record.getEffectiveDate())
+                .expiryDate(record.getExpiryDate())
+                .maxAmountPerTransaction(record.getMaxAmountPerTransaction())
+                .maxAmountPerMonth(record.getMaxAmountPerMonth())
+                .maxTransactionsPerMonth(record.getMaxTransactionsPerMonth())
+                .currency(record.getCurrency())
+                .description(record.getDescription())
+                .schemeType(record.getSchemeType())
+                .build();
     }
 
     private void resetStatistics() {
@@ -226,6 +291,8 @@ public class MandateProcessor {
         updateCount = 0;
         skipCount = 0;
         errorCount = 0;
+        newCreditors = 0;
+        newDebtors = 0;
     }
 
     private void logStatistics(long durationMs) {
@@ -237,16 +304,11 @@ public class MandateProcessor {
         logger.info("Updated: {}", updateCount);
         logger.info("Skipped (unchanged): {}", skipCount);
         logger.info("Errors: {}", errorCount);
+        logger.info("New Creditors: {}", newCreditors);
+        logger.info("New Debtors: {}", newDebtors);
         logger.info("Duration: {} ms", durationMs);
         logger.info("Throughput: {} records/sec",
                 durationMs > 0 ? (totalProcessed * 1000 / durationMs) : 0);
         logger.info("========================================");
     }
-
-    // Getters for statistics
-    public long getTotalProcessed() { return totalProcessed; }
-    public long getInsertCount() { return insertCount; }
-    public long getUpdateCount() { return updateCount; }
-    public long getSkipCount() { return skipCount; }
-    public long getErrorCount() { return errorCount; }
 }

@@ -1,17 +1,12 @@
 package com.mongodb.mandate.repository;
 
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.*;
 import com.mongodb.client.model.*;
-import com.mongodb.mandate.model.DirectDebitMandate;
-import com.mongodb.mandate.model.MandateAudit;
+import com.mongodb.mandate.model.*;
 import org.bson.Document;
 import org.bson.codecs.configuration.CodecRegistries;
 import org.bson.codecs.configuration.CodecRegistry;
 import org.bson.codecs.pojo.PojoCodecProvider;
-import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,9 +24,10 @@ public class MandateRepository implements Closeable {
     private final MongoDatabase database;
     private final MongoCollection<DirectDebitMandate> mandateCollection;
     private final MongoCollection<MandateAudit> auditCollection;
+    private final MongoCollection<Creditor> creditorCollection;
+    private final MongoCollection<Debtor> debtorCollection;
 
     public MandateRepository(String connectionString, String databaseName) {
-        // Configure POJO codec
         CodecRegistry pojoCodecRegistry = CodecRegistries.fromRegistries(
                 getDefaultCodecRegistry(),
                 CodecRegistries.fromProviders(
@@ -43,6 +39,8 @@ public class MandateRepository implements Closeable {
         this.database = mongoClient.getDatabase(databaseName).withCodecRegistry(pojoCodecRegistry);
         this.mandateCollection = database.getCollection("mandates", DirectDebitMandate.class);
         this.auditCollection = database.getCollection("mandate_audits", MandateAudit.class);
+        this.creditorCollection = database.getCollection("creditors", Creditor.class);
+        this.debtorCollection = database.getCollection("debtors", Debtor.class);
 
         ensureIndexes();
     }
@@ -50,8 +48,7 @@ public class MandateRepository implements Closeable {
     private void ensureIndexes() {
         logger.info("Ensuring indexes exist...");
 
-        // Create compound index on mandateId and lastUpdateDate for efficient lookups
-        // This is a covering index for our batch queries
+        // Mandate indexes
         mandateCollection.createIndex(
                 Indexes.compoundIndex(
                         Indexes.ascending("mandateId"),
@@ -60,70 +57,58 @@ public class MandateRepository implements Closeable {
                 new IndexOptions().name("idx_mandate_lookup").unique(true)
         );
 
-        // Index on audit collection for querying by mandateId
+        // Audit indexes
         auditCollection.createIndex(
                 Indexes.ascending("mandateId"),
                 new IndexOptions().name("idx_audit_mandateId")
         );
-
-        // Index on audit collection for querying by timestamp
         auditCollection.createIndex(
                 Indexes.descending("changeTimestamp"),
                 new IndexOptions().name("idx_audit_timestamp")
         );
 
+        // Creditor indexes
+        creditorCollection.createIndex(
+                Indexes.ascending("creditorId"),
+                new IndexOptions().name("idx_creditor_id").unique(true)
+        );
+
+        // Debtor indexes
+        debtorCollection.createIndex(
+                Indexes.ascending("debtorId"),
+                new IndexOptions().name("idx_debtor_id").unique(true)
+        );
+
         logger.info("Indexes created successfully");
     }
 
-    /**
-     * Batch query to get mandateId and lastUpdateDate for a list of mandate IDs.
-     * Uses projection to only return the fields we need (covered by index).
-     */
+    public MongoClient getMongoClient() {
+        return mongoClient;
+    }
+
+    public MongoDatabase getDatabase() {
+        return database;
+    }
+
+    // Batch lookup for mandate dates
     public Map<String, LocalDateTime> batchGetMandateUpdateDates(List<String> mandateIds) {
         Map<String, LocalDateTime> result = new HashMap<>();
+        if (mandateIds.isEmpty()) return result;
 
-        if (mandateIds.isEmpty()) {
-            return result;
-        }
-
-        Bson filter = Filters.in("mandateId", mandateIds);
-
-        // Project only the fields we need - this query is covered by our index
-        Bson projection = Projections.fields(
-                Projections.include("mandateId", "lastUpdateDate"),
-                Projections.excludeId()
-        );
-
-        // Use hint to ensure we use our covering index
-        mandateCollection.find(filter)
-                .projection(projection)
-                .hint(new Document("mandateId", 1).append("lastUpdateDate", 1))
-                .forEach(mandate -> {
-                    result.put(mandate.getMandateId(), mandate.getLastUpdateDate());
-                });
+        mandateCollection.find(Filters.in("mandateId", mandateIds))
+                .projection(Projections.fields(
+                        Projections.include("mandateId", "lastUpdateDate"),
+                        Projections.excludeId()
+                ))
+                .forEach(mandate -> result.put(mandate.getMandateId(), mandate.getLastUpdateDate()));
 
         return result;
     }
 
-    /**
-     * Get full mandate document by mandateId for comparison
-     */
-    public Optional<DirectDebitMandate> getMandateById(String mandateId) {
-        DirectDebitMandate mandate = mandateCollection.find(
-                Filters.eq("mandateId", mandateId)
-        ).first();
-        return Optional.ofNullable(mandate);
-    }
-
-    /**
-     * Batch get full mandate documents for comparison
-     */
+    // Batch get full mandates
     public Map<String, DirectDebitMandate> batchGetMandates(List<String> mandateIds) {
         Map<String, DirectDebitMandate> result = new HashMap<>();
-
-        if (mandateIds.isEmpty()) {
-            return result;
-        }
+        if (mandateIds.isEmpty()) return result;
 
         mandateCollection.find(Filters.in("mandateId", mandateIds))
                 .forEach(mandate -> result.put(mandate.getMandateId(), mandate));
@@ -131,88 +116,86 @@ public class MandateRepository implements Closeable {
         return result;
     }
 
-    /**
-     * Insert a new mandate
-     */
-    public void insertMandate(DirectDebitMandate mandate) {
-        mandate.setCreatedAt(LocalDateTime.now());
-        mandate.setVersion(1);
-        mandateCollection.insertOne(mandate);
-        logger.debug("Inserted mandate: {}", mandate.getMandateId());
+    // Check existing creditors
+    public Set<String> getExistingCreditorIds(Set<String> creditorIds) {
+        Set<String> existing = new HashSet<>();
+        if (creditorIds.isEmpty()) return existing;
+
+        creditorCollection.find(Filters.in("creditorId", creditorIds))
+                .projection(Projections.include("creditorId"))
+                .forEach(c -> existing.add(c.getCreditorId()));
+
+        return existing;
     }
 
-    /**
-     * Batch insert mandates
-     */
-    public void batchInsertMandates(List<DirectDebitMandate> mandates) {
-        if (mandates.isEmpty()) {
-            return;
+    // Check existing debtors
+    public Set<String> getExistingDebtorIds(Set<String> debtorIds) {
+        Set<String> existing = new HashSet<>();
+        if (debtorIds.isEmpty()) return existing;
+
+        debtorCollection.find(Filters.in("debtorId", debtorIds))
+                .projection(Projections.include("debtorId"))
+                .forEach(d -> existing.add(d.getDebtorId()));
+
+        return existing;
+    }
+
+    // Transactional insert for new mandates with creditor/debtor
+    public void insertMandateWithTransaction(ClientSession session,
+                                             DirectDebitMandate mandate,
+                                             Creditor creditor,
+                                             Debtor debtor,
+                                             boolean insertCreditor,
+                                             boolean insertDebtor) {
+        LocalDateTime now = LocalDateTime.now();
+
+        // Insert creditor if new
+        if (insertCreditor && creditor != null) {
+            creditor.setCreatedAt(now);
+            creditor.setUpdatedAt(now);
+            creditorCollection.insertOne(session, creditor);
         }
 
-        LocalDateTime now = LocalDateTime.now();
-        mandates.forEach(m -> {
-            m.setCreatedAt(now);
-            m.setVersion(1);
-        });
+        // Insert debtor if new
+        if (insertDebtor && debtor != null) {
+            debtor.setCreatedAt(now);
+            debtor.setUpdatedAt(now);
+            debtorCollection.insertOne(session, debtor);
+        }
 
-        mandateCollection.insertMany(mandates);
-        logger.info("Batch inserted {} mandates", mandates.size());
+        // Insert mandate
+        mandate.setCreatedAt(now);
+        mandate.setVersion(1);
+        mandateCollection.insertOne(session, mandate);
     }
 
-    /**
-     * Update an existing mandate
-     */
+    // Update mandate
     public void updateMandate(DirectDebitMandate mandate) {
         mandate.setVersion(mandate.getVersion() != null ? mandate.getVersion() + 1 : 1);
-
         mandateCollection.replaceOne(
                 Filters.eq("mandateId", mandate.getMandateId()),
                 mandate
         );
-        logger.debug("Updated mandate: {}", mandate.getMandateId());
     }
 
-    /**
-     * Batch update mandates using bulk write
-     */
-    public void batchUpdateMandates(List<DirectDebitMandate> mandates) {
-        if (mandates.isEmpty()) {
-            return;
-        }
-
-        List<WriteModel<DirectDebitMandate>> updates = new ArrayList<>();
-
-        for (DirectDebitMandate mandate : mandates) {
-            mandate.setVersion(mandate.getVersion() != null ? mandate.getVersion() + 1 : 1);
-
-            updates.add(new ReplaceOneModel<>(
-                    Filters.eq("mandateId", mandate.getMandateId()),
-                    mandate
-            ));
-        }
-
-        mandateCollection.bulkWrite(updates, new BulkWriteOptions().ordered(false));
-        logger.info("Batch updated {} mandates", mandates.size());
+    // Update debtor
+    public void updateDebtor(Debtor debtor) {
+        debtor.setUpdatedAt(LocalDateTime.now());
+        debtorCollection.replaceOne(
+                Filters.eq("debtorId", debtor.getDebtorId()),
+                debtor
+        );
     }
 
-    /**
-     * Insert audit record
-     */
+    // Batch insert audits
+    public void batchInsertAudits(List<MandateAudit> audits) {
+        if (audits.isEmpty()) return;
+        auditCollection.insertMany(audits);
+    }
+
+    // Insert single audit
     public void insertAudit(MandateAudit audit) {
         auditCollection.insertOne(audit);
-        logger.debug("Inserted audit for mandate: {}", audit.getMandateId());
-    }
-
-    /**
-     * Batch insert audit records
-     */
-    public void batchInsertAudits(List<MandateAudit> audits) {
-        if (audits.isEmpty()) {
-            return;
-        }
-
-        auditCollection.insertMany(audits);
-        logger.info("Batch inserted {} audit records", audits.size());
     }
 
     @Override

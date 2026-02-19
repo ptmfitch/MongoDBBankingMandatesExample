@@ -7,20 +7,17 @@ echo "Clearing collections in $MONGODB_DATABASE..."
 echo ""
 
 mongosh "$MONGODB_URI/$MONGODB_DATABASE" --eval '
-    const mandateCount = db.mandates.countDocuments({});
-    const auditCount = db.mandate_audits.countDocuments({});
-
     print("Before deletion:");
-    print("  mandates:       " + mandateCount + " documents");
-    print("  mandate_audits: " + auditCount + " documents");
+    print("  mandates:       " + db.mandates.countDocuments({}) + " documents");
+    print("  mandate_audits: " + db.mandate_audits.countDocuments({}) + " documents");
+    print("  creditors:      " + db.creditors.countDocuments({}) + " documents");
+    print("  debtors:        " + db.debtors.countDocuments({}) + " documents");
     print("");
 
-    const mandateResult = db.mandates.deleteMany({});
-    const auditResult = db.mandate_audits.deleteMany({});
+    db.mandates.deleteMany({});
+    db.mandate_audits.deleteMany({});
+    db.creditors.deleteMany({});
+    db.debtors.deleteMany({});
 
-    print("Deleted:");
-    print("  mandates:       " + mandateResult.deletedCount + " documents");
-    print("  mandate_audits: " + auditResult.deletedCount + " documents");
-    print("");
-    print("✓ Collections cleared (indexes preserved)");
+    print("✓ All collections cleared (indexes preserved)");
 '
