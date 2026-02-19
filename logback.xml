@@ -17,10 +17,11 @@
         </encoder>
     </appender>
 
-    <logger name="com.mongodb.mandate" level="DEBUG"/>
+    <!-- Change from DEBUG to INFO or WARN -->
+    <logger name="com.mongodb.mandate" level="INFO"/>
     <logger name="org.mongodb" level="WARN"/>
 
-    <root level="INFO">
+    <root level="WARN">
         <appender-ref ref="CONSOLE"/>
         <appender-ref ref="FILE"/>
     </root>

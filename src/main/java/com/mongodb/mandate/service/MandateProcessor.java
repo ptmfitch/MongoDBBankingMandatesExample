@@ -1,7 +1,9 @@
 package com.mongodb.mandate.service;
 
 import com.mongodb.client.ClientSession;
-import com.mongodb.client.TransactionBody;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.InsertManyOptions;
 import com.mongodb.mandate.model.*;
 import com.mongodb.mandate.repository.MandateRepository;
 import org.slf4j.Logger;
@@ -50,7 +52,7 @@ public class MandateProcessor {
                 processBatch(batch, reader.getFileName(), batchId);
                 totalProcessed += batch.size();
 
-                if (totalProcessed % 1000 == 0) {
+                if (totalProcessed % 10000 == 0) {
                     logger.info("Processed {} records...", totalProcessed);
                 }
             }
@@ -61,16 +63,13 @@ public class MandateProcessor {
     }
 
     private void processBatch(List<MandateFileRecord> records, String sourceFile, String batchId) {
-        // Extract mandate IDs
         List<String> mandateIds = records.stream()
                 .map(MandateFileRecord::getMandateId)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
-        // Get existing mandate dates
         Map<String, LocalDateTime> existingDates = repository.batchGetMandateUpdateDates(mandateIds);
 
-        // Categorize records
         List<MandateFileRecord> toInsert = new ArrayList<>();
         List<String> toCheckForUpdate = new ArrayList<>();
 
@@ -91,18 +90,16 @@ public class MandateProcessor {
             }
         }
 
-        // Process inserts with transactions
         if (!toInsert.isEmpty()) {
-            processInserts(toInsert, sourceFile, batchId);
+            processBatchInserts(toInsert, sourceFile, batchId);
         }
 
-        // Process updates
         if (!toCheckForUpdate.isEmpty()) {
             processUpdates(records, toCheckForUpdate, sourceFile, batchId);
         }
     }
 
-    private void processInserts(List<MandateFileRecord> records, String sourceFile, String batchId) {
+    private void processBatchInserts(List<MandateFileRecord> records, String sourceFile, String batchId) {
         // Collect all creditor and debtor IDs
         Set<String> creditorIds = records.stream()
                 .map(MandateFileRecord::getCreditorId)
@@ -116,62 +113,87 @@ public class MandateProcessor {
         Set<String> existingCreditors = repository.getExistingCreditorIds(creditorIds);
         Set<String> existingDebtors = repository.getExistingDebtorIds(debtorIds);
 
+        // Build batch lists
+        List<Creditor> creditorsToInsert = new ArrayList<>();
+        List<Debtor> debtorsToInsert = new ArrayList<>();
+        List<DirectDebitMandate> mandatesToInsert = new ArrayList<>();
         List<MandateAudit> audits = new ArrayList<>();
+
         LocalDateTime now = LocalDateTime.now();
+        Set<String> creditorsInBatch = new HashSet<>();
+        Set<String> debtorsInBatch = new HashSet<>();
 
         for (MandateFileRecord record : records) {
             String debtorId = record.generateDebtorId();
-            boolean insertCreditor = !existingCreditors.contains(record.getCreditorId());
-            boolean insertDebtor = !existingDebtors.contains(debtorId);
 
-            // Build entities
-            Creditor creditor = insertCreditor ? buildCreditor(record) : null;
-            Debtor debtor = insertDebtor ? buildDebtor(record, debtorId) : null;
-            DirectDebitMandate mandate = buildMandate(record, debtorId);
-
-            try {
-                // Use transaction for insert
-                try (ClientSession session = repository.getMongoClient().startSession()) {
-                    session.withTransaction((TransactionBody<Void>) () -> {
-                        repository.insertMandateWithTransaction(
-                                session, mandate, creditor, debtor, insertCreditor, insertDebtor);
-                        return null;
-                    });
-                }
-
-                // Track new entities
-                if (insertCreditor) {
-                    existingCreditors.add(record.getCreditorId());
-                    newCreditors++;
-                }
-                if (insertDebtor) {
-                    existingDebtors.add(debtorId);
-                    newDebtors++;
-                }
-
-                insertCount++;
-
-                // Create audit
-                audits.add(MandateAudit.builder()
-                        .mandateId(record.getMandateId())
-                        .changeType("INSERT")
-                        .changeTimestamp(now)
-                        .sourceFile(sourceFile)
-                        .newUpdateDate(record.getLastUpdateDate())
-                        .fieldChanges(Collections.emptyList())
-                        .processedBy(System.getProperty("user.name", "system"))
-                        .batchId(batchId)
-                        .build());
-
-            } catch (Exception e) {
-                logger.error("Transaction failed for mandate {}: {}", record.getMandateId(), e.getMessage());
-                errorCount++;
+            // Build creditor if new (and not already in this batch)
+            if (!existingCreditors.contains(record.getCreditorId())
+                    && !creditorsInBatch.contains(record.getCreditorId())) {
+                Creditor creditor = buildCreditor(record);
+                creditor.setCreatedAt(now);
+                creditor.setUpdatedAt(now);
+                creditorsToInsert.add(creditor);
+                creditorsInBatch.add(record.getCreditorId());
             }
+
+            // Build debtor if new (and not already in this batch)
+            if (!existingDebtors.contains(debtorId)
+                    && !debtorsInBatch.contains(debtorId)) {
+                Debtor debtor = buildDebtor(record, debtorId);
+                debtor.setCreatedAt(now);
+                debtor.setUpdatedAt(now);
+                debtorsToInsert.add(debtor);
+                debtorsInBatch.add(debtorId);
+            }
+
+            // Build mandate
+            DirectDebitMandate mandate = buildMandate(record, debtorId);
+            mandate.setCreatedAt(now);
+            mandate.setVersion(1);
+            mandatesToInsert.add(mandate);
+
+            // Build audit
+            audits.add(MandateAudit.builder()
+                    .mandateId(record.getMandateId())
+                    .changeType("INSERT")
+                    .changeTimestamp(now)
+                    .sourceFile(sourceFile)
+                    .newUpdateDate(record.getLastUpdateDate())
+                    .fieldChanges(Collections.emptyList())
+                    .processedBy(System.getProperty("user.name", "system"))
+                    .batchId(batchId)
+                    .build());
         }
 
-        // Batch insert audits
-        if (!audits.isEmpty()) {
-            repository.batchInsertAudits(audits);
+        // Execute batch insert in a single transaction
+        try (ClientSession session = repository.getMongoClient().startSession()) {
+            session.startTransaction();
+
+            try {
+                if (!creditorsToInsert.isEmpty()) {
+                    repository.batchInsertCreditors(session, creditorsToInsert);
+                    newCreditors += creditorsToInsert.size();
+                }
+
+                if (!debtorsToInsert.isEmpty()) {
+                    repository.batchInsertDebtors(session, debtorsToInsert);
+                    newDebtors += debtorsToInsert.size();
+                }
+
+                repository.batchInsertMandates(session, mandatesToInsert);
+                repository.batchInsertAudits(session, audits);
+
+                session.commitTransaction();
+                insertCount += mandatesToInsert.size();
+
+                logger.debug("Batch inserted {} mandates, {} creditors, {} debtors",
+                        mandatesToInsert.size(), creditorsToInsert.size(), debtorsToInsert.size());
+
+            } catch (Exception e) {
+                session.abortTransaction();
+                logger.error("Batch transaction failed: {}", e.getMessage());
+                errorCount += records.size();
+            }
         }
     }
 
@@ -185,6 +207,7 @@ public class MandateProcessor {
 
         Map<String, DirectDebitMandate> existingMandates = repository.batchGetMandates(mandateIdsToUpdate);
 
+        List<DirectDebitMandate> mandatesToUpdate = new ArrayList<>();
         List<MandateAudit> audits = new ArrayList<>();
         LocalDateTime now = LocalDateTime.now();
 
@@ -200,42 +223,39 @@ public class MandateProcessor {
             String debtorId = record.generateDebtorId();
             DirectDebitMandate updated = buildMandate(record, debtorId);
 
-            // Diff the mandates
             List<FieldChange> changes = diffService.diff(existing, updated);
 
             if (!changes.isEmpty()) {
-                // Preserve system fields
                 updated.setId(existing.getId());
                 updated.setCreatedAt(existing.getCreatedAt());
-                updated.setVersion(existing.getVersion());
+                updated.setVersion(existing.getVersion() != null ? existing.getVersion() + 1 : 1);
+                mandatesToUpdate.add(updated);
 
-                try {
-                    repository.updateMandate(updated);
-                    updateCount++;
-
-                    audits.add(MandateAudit.builder()
-                            .mandateId(mandateId)
-                            .changeType("UPDATE")
-                            .changeTimestamp(now)
-                            .sourceFile(sourceFile)
-                            .previousUpdateDate(existing.getLastUpdateDate())
-                            .newUpdateDate(record.getLastUpdateDate())
-                            .fieldChanges(changes)
-                            .processedBy(System.getProperty("user.name", "system"))
-                            .batchId(batchId)
-                            .build());
-
-                } catch (Exception e) {
-                    logger.error("Update failed for mandate {}: {}", mandateId, e.getMessage());
-                    errorCount++;
-                }
+                audits.add(MandateAudit.builder()
+                        .mandateId(mandateId)
+                        .changeType("UPDATE")
+                        .changeTimestamp(now)
+                        .sourceFile(sourceFile)
+                        .previousUpdateDate(existing.getLastUpdateDate())
+                        .newUpdateDate(record.getLastUpdateDate())
+                        .fieldChanges(changes)
+                        .processedBy(System.getProperty("user.name", "system"))
+                        .batchId(batchId)
+                        .build());
             } else {
                 skipCount++;
             }
         }
 
-        if (!audits.isEmpty()) {
-            repository.batchInsertAudits(audits);
+        if (!mandatesToUpdate.isEmpty()) {
+            try {
+                repository.batchUpdateMandates(mandatesToUpdate);
+                repository.batchInsertAudits(audits);
+                updateCount += mandatesToUpdate.size();
+            } catch (Exception e) {
+                logger.error("Batch update failed: {}", e.getMessage());
+                errorCount += mandatesToUpdate.size();
+            }
         }
     }
 

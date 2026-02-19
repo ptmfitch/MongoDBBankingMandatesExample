@@ -48,7 +48,6 @@ public class MandateRepository implements Closeable {
     private void ensureIndexes() {
         logger.info("Ensuring indexes exist...");
 
-        // Mandate indexes
         mandateCollection.createIndex(
                 Indexes.compoundIndex(
                         Indexes.ascending("mandateId"),
@@ -57,7 +56,6 @@ public class MandateRepository implements Closeable {
                 new IndexOptions().name("idx_mandate_lookup").unique(true)
         );
 
-        // Audit indexes
         auditCollection.createIndex(
                 Indexes.ascending("mandateId"),
                 new IndexOptions().name("idx_audit_mandateId")
@@ -67,13 +65,11 @@ public class MandateRepository implements Closeable {
                 new IndexOptions().name("idx_audit_timestamp")
         );
 
-        // Creditor indexes
         creditorCollection.createIndex(
                 Indexes.ascending("creditorId"),
                 new IndexOptions().name("idx_creditor_id").unique(true)
         );
 
-        // Debtor indexes
         debtorCollection.createIndex(
                 Indexes.ascending("debtorId"),
                 new IndexOptions().name("idx_debtor_id").unique(true)
@@ -84,10 +80,6 @@ public class MandateRepository implements Closeable {
 
     public MongoClient getMongoClient() {
         return mongoClient;
-    }
-
-    public MongoDatabase getDatabase() {
-        return database;
     }
 
     // Batch lookup for mandate dates
@@ -140,62 +132,50 @@ public class MandateRepository implements Closeable {
         return existing;
     }
 
-    // Transactional insert for new mandates with creditor/debtor
-    public void insertMandateWithTransaction(ClientSession session,
-                                             DirectDebitMandate mandate,
-                                             Creditor creditor,
-                                             Debtor debtor,
-                                             boolean insertCreditor,
-                                             boolean insertDebtor) {
-        LocalDateTime now = LocalDateTime.now();
-
-        // Insert creditor if new
-        if (insertCreditor && creditor != null) {
-            creditor.setCreatedAt(now);
-            creditor.setUpdatedAt(now);
-            creditorCollection.insertOne(session, creditor);
-        }
-
-        // Insert debtor if new
-        if (insertDebtor && debtor != null) {
-            debtor.setCreatedAt(now);
-            debtor.setUpdatedAt(now);
-            debtorCollection.insertOne(session, debtor);
-        }
-
-        // Insert mandate
-        mandate.setCreatedAt(now);
-        mandate.setVersion(1);
-        mandateCollection.insertOne(session, mandate);
+    // Batch insert creditors with session
+    public void batchInsertCreditors(ClientSession session, List<Creditor> creditors) {
+        if (creditors.isEmpty()) return;
+        creditorCollection.insertMany(session, creditors, new InsertManyOptions().ordered(false));
     }
 
-    // Update mandate
-    public void updateMandate(DirectDebitMandate mandate) {
-        mandate.setVersion(mandate.getVersion() != null ? mandate.getVersion() + 1 : 1);
-        mandateCollection.replaceOne(
-                Filters.eq("mandateId", mandate.getMandateId()),
-                mandate
-        );
+    // Batch insert debtors with session
+    public void batchInsertDebtors(ClientSession session, List<Debtor> debtors) {
+        if (debtors.isEmpty()) return;
+        debtorCollection.insertMany(session, debtors, new InsertManyOptions().ordered(false));
     }
 
-    // Update debtor
-    public void updateDebtor(Debtor debtor) {
-        debtor.setUpdatedAt(LocalDateTime.now());
-        debtorCollection.replaceOne(
-                Filters.eq("debtorId", debtor.getDebtorId()),
-                debtor
-        );
+    // Batch insert mandates with session
+    public void batchInsertMandates(ClientSession session, List<DirectDebitMandate> mandates) {
+        if (mandates.isEmpty()) return;
+        mandateCollection.insertMany(session, mandates, new InsertManyOptions().ordered(false));
     }
 
-    // Batch insert audits
+    // Batch insert audits with session
+    public void batchInsertAudits(ClientSession session, List<MandateAudit> audits) {
+        if (audits.isEmpty()) return;
+        auditCollection.insertMany(session, audits, new InsertManyOptions().ordered(false));
+    }
+
+    // Batch insert audits without session (for updates)
     public void batchInsertAudits(List<MandateAudit> audits) {
         if (audits.isEmpty()) return;
-        auditCollection.insertMany(audits);
+        auditCollection.insertMany(audits, new InsertManyOptions().ordered(false));
     }
 
-    // Insert single audit
-    public void insertAudit(MandateAudit audit) {
-        auditCollection.insertOne(audit);
+    // Batch update mandates using bulk write
+    public void batchUpdateMandates(List<DirectDebitMandate> mandates) {
+        if (mandates.isEmpty()) return;
+
+        List<WriteModel<DirectDebitMandate>> updates = new ArrayList<>();
+
+        for (DirectDebitMandate mandate : mandates) {
+            updates.add(new ReplaceOneModel<>(
+                    Filters.eq("mandateId", mandate.getMandateId()),
+                    mandate
+            ));
+        }
+
+        mandateCollection.bulkWrite(updates, new BulkWriteOptions().ordered(false));
     }
 
     @Override
